@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -48,6 +50,26 @@ var databaseSchema = map[string]*schema.Schema{
 		ForceNew:      true,
 		ConflictsWith: []string{"from_share", "from_database"},
 	},
+	"replication_configuration": {
+		Type:        schema.TypeList,
+		Description: "When set, specifies the configurations for database replication.",
+		Optional:    true,
+		ForceNew:    true,
+		MaxItems:    1,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"accounts": {
+					Type:     schema.TypeList,
+					Required: true,
+					Elem:     &schema.Schema{Type: schema.TypeString},
+				},
+				"ignore_edition_check": {
+					Type:     schema.TypeBool,
+					Optional: true,
+				},
+			},
+		},
+	},
 	"tag": tagReferenceSchema,
 }
 
@@ -80,6 +102,22 @@ func CreateDatabase(d *schema.ResourceData, meta interface{}) error {
 
 	if _, ok := d.GetOk("from_replica"); ok {
 		return createDatabaseFromReplica(d, meta)
+	}
+
+	// If set, enable replication
+	if replicationConfiguration, ok := d.GetOk("replication_configuration"); ok {
+		db := meta.(*sql.DB)
+		databaseName := d.Get("name").(string)
+		//accounts := replicationConfiguration.([]interface{})[0]
+		accounts := replicationConfiguration
+
+		// convert interface to string
+		//accounts := replicationConfiguration.(map[string]interface{})["accounts"]
+		sqlQuery := fmt.Sprintf(`ALTER DATABASE %v ENABLE REPLICATION TO ACCOUNTS %s`, databaseName, accounts)
+		err := snowflake.Exec(db, sqlQuery)
+		if err != nil {
+			return errors.Wrapf(err, "error when enabling replication")
+		}
 	}
 
 	return CreateResource("database", databaseProperties, databaseSchema, snowflake.Database, ReadDatabase)(d, meta)
@@ -184,4 +222,21 @@ func UpdateDatabase(d *schema.ResourceData, meta interface{}) error {
 
 func DeleteDatabase(d *schema.ResourceData, meta interface{}) error {
 	return DeleteResource("database", snowflake.Database)(d, meta)
+}
+
+func parseArguments(arguments string) (map[string]interface{}, error) {
+	r := regexp.MustCompile(`(?P<callable_name>[^(]+)\((?P<argument_signature>[^)]*)\) RETURN (?P<return_type>.*)`)
+	matches := r.FindStringSubmatch(arguments)
+	if len(matches) == 0 {
+		return nil, errors.New(fmt.Sprintf(`Could not parse arguments: %v`, arguments))
+	}
+	callableSignatureMap := make(map[string]interface{})
+
+	argumentTypes := strings.Split(matches[2], ", ")
+
+	callableSignatureMap["callableName"] = matches[1]
+	callableSignatureMap["argumentTypes"] = argumentTypes
+	callableSignatureMap["returnType"] = matches[3]
+
+	return callableSignatureMap, nil
 }
